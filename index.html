@@ -691,6 +691,13 @@
   <p class="hint" id="mbtImportInfo" style="margin-top:4px"></p>
   <p class="hint">Un archivo <b>.mbtiles</b> (exportado p. ej. desde QGIS) se guarda en esta tableta. Puedes tener <b>varios encendidos a la vez</b>: se dibujan sobre el mapa de fondo, en el orden en que los enciendes. Con 🔍 la vista va hasta el mapa y con 🗑️ se borra de la tableta.</p>
 
+  <div class="seccion-tit" style="font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--gris-tx);margin:12px 2px 6px;font-weight:800">Mapas vectoriales OSM (.map)</div>
+  <div id="mfList"></div>
+  <button class="ghost" id="bMfImport">🗺️ Importar mapa .osm.map</button>
+  <input type="file" id="mfImportFile" accept=".map,application/octet-stream,*/*" style="display:none">
+  <p class="hint" id="mfImportInfo" style="margin-top:4px"></p>
+  <p class="hint">Un archivo <b>.osm.map</b> (formato <b>Mapsforge</b>, el de OruxMaps, Locus u <b>OpenAndroMaps</b>) trae los datos de OpenStreetMap en vectorial, no imágenes: una provincia entera ocupa unas decenas de MB y se dibuja aquí mismo, sin conexión, con pistas, sendas, arbolado, agua, curvas de nivel y topónimos. Se enciende y se apaga igual que los MBTiles.</p>
+
   <div class="seccion-tit" style="font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--gris-tx);margin:12px 2px 6px;font-weight:800">Uso sin conexión</div>
   <button class="ghost" id="bSaveZone">📥 Guardar esta zona sin conexión</button>
   <button class="ghost" id="bZoneCancel" style="display:none;border-color:#e7b6b0;color:#b5392c">✖ Cancelar descarga</button>
@@ -1883,6 +1890,8 @@ function aplicarBaseOpacidad(){
      no serviría de nada: la transparencia se les aplica también, que es lo que hacía
      antes, cuando un MBTiles era el propio mapa de fondo. */
   Object.values(mbtLayers).forEach(en=>en.layer.setOpacity(baseOpacidad));
+  /* Lo mismo con los mapas vectoriales .map, que se leen más abajo en este script */
+  if(typeof mfAplicarOpacidad==='function') mfAplicarOpacidad(baseOpacidad);
   const el=document.getElementById('baseOpValor');
   if(el) el.textContent=Math.round((1-baseOpacidad)*100)+' %';
   const sl=document.getElementById('baseOp');
@@ -2296,6 +2305,972 @@ document.getElementById('mbtImportFile').onchange=async (e)=>{
   guardarMbtActivos();
   renderMbtList();
   for(const id of mbtActivos.slice()) await mostrarMbt(id,true);
+})();
+
+/* ===================== Mapas vectoriales OSM (.map de Mapsforge) =====================
+   Un archivo ".osm.map" (o ".map" a secas) es un mapa VECTORIAL en el formato binario
+   de Mapsforge: el que usan OruxMaps, Locus, Cruiser u OpenAndroMaps. No trae imágenes
+   ya dibujadas como un MBTiles, sino los propios datos de OpenStreetMap (carreteras,
+   pistas, sendas, ríos, masas de arbolado, curvas de nivel, topónimos…) comprimidos y
+   troceados en teselas. Eso lo hace mucho más ligero que un mosaico de imágenes: una
+   provincia entera cabe en unas decenas de MB.
+
+   No existe ninguna biblioteca de JavaScript que lea este formato, así que aquí va un
+   lector propio. El formato está documentado por Mapsforge y es, resumido:
+
+     · cabecera: recuadro que abarca el mapa, lista de etiquetas OSM que usa el archivo
+       y los "intervalos de zoom" (normalmente 3: uno para vista lejana, otro media y
+       otro cercana, cada uno con su propio zoom base y su propio sub-archivo).
+     · cada sub-archivo empieza por un índice de teselas (5 bytes por tesela, la
+       posición donde empiezan sus datos) y sigue con las teselas una detrás de otra.
+     · cada tesela trae una tabla de cuántos puntos y cuántas vías aparecen en cada
+       nivel de zoom, y después los puntos y las vías. Las coordenadas van en
+       microgrados y en DIFERENCIAS respecto a la esquina de la tesela y respecto al
+       punto anterior, con números de longitud variable (7 bits por byte). De ahí que
+       ocupe tan poco.
+
+   El archivo NO se carga entero en memoria: se guarda como Blob en IndexedDB y se van
+   leyendo trocitos (blob.slice) según hacen falta, así que el tamaño del mapa lo limita
+   el almacenamiento de la tableta, no su RAM.
+
+   Lo que se lee se convierte en elementos vectoriales de OpenLayers y se pinta con el
+   estilo de más abajo, pensado para trabajo de campo: pistas y sendas bien visibles,
+   arbolado, agua, curvas de nivel y topónimos. */
+
+const MF_UTF8 = new TextDecoder('utf-8');
+const MF_MAGIA = 'mapsforge binary OSM';
+
+/* -------- Lector de bytes con los tipos de número que usa Mapsforge -------- */
+function MfBuf(ab){ this.dv=new DataView(ab); this.u8=new Uint8Array(ab); this.p=0; }
+MfBuf.prototype.saltar =function(n){ this.p+=n; };
+MfBuf.prototype.byte   =function(){ return this.dv.getInt8(this.p++); };
+MfBuf.prototype.ubyte  =function(){ return this.u8[this.p++]; };
+MfBuf.prototype.short  =function(){ const v=this.dv.getInt16(this.p);  this.p+=2; return v; };
+MfBuf.prototype.ushort =function(){ const v=this.dv.getUint16(this.p); this.p+=2; return v; };
+MfBuf.prototype.int    =function(){ const v=this.dv.getInt32(this.p);  this.p+=4; return v; };
+MfBuf.prototype.float  =function(){ const v=this.dv.getFloat32(this.p);this.p+=4; return v; };
+/* 8 bytes. Se compone a mano en vez de con BigInt: son tamaños y posiciones de archivo,
+   siempre muy por debajo del entero seguro de JavaScript. */
+MfBuf.prototype.long   =function(){ const hi=this.dv.getUint32(this.p), lo=this.dv.getUint32(this.p+4); this.p+=8; return hi*4294967296+lo; };
+/* Entero sin signo de longitud variable: 7 bits útiles por byte, el bit alto indica
+   que todavía quedan más bytes. */
+MfBuf.prototype.vuint  =function(){
+  let v=0, s=1, b;
+  do{ b=this.u8[this.p++]; v+=(b&0x7f)*s; s*=128; }while(b&0x80);
+  return v;
+};
+/* Igual, pero el ÚLTIMO byte reserva el bit 0x40 para el signo y sólo aporta 6 bits. */
+MfBuf.prototype.vint   =function(){
+  let v=0, s=1, b=this.u8[this.p++];
+  while(b&0x80){ v+=(b&0x7f)*s; s*=128; b=this.u8[this.p++]; }
+  v+=(b&0x3f)*s;
+  return (b&0x40)?-v:v;
+};
+/* Cadena UTF-8 precedida de su longitud en bytes */
+MfBuf.prototype.str    =function(){
+  const n=this.vuint();
+  const s=MF_UTF8.decode(this.u8.subarray(this.p,this.p+n));
+  this.p+=n; return s;
+};
+
+/* -------- Teselas de Mercator (las mismas que usa cualquier mapa XYZ) -------- */
+function mfLonATesela(lon,z){ return Math.max(0,Math.min(Math.pow(2,z)-1, Math.floor((lon+180)/360*Math.pow(2,z)))); }
+function mfLatATesela(lat,z){
+  const r=lat*Math.PI/180;
+  const y=Math.floor((1-Math.log(Math.tan(r)+1/Math.cos(r))/Math.PI)/2*Math.pow(2,z));
+  return Math.max(0,Math.min(Math.pow(2,z)-1,y));
+}
+function mfTeselaALon(x,z){ return x/Math.pow(2,z)*360-180; }
+function mfTeselaALat(y,z){
+  const t=Math.PI-2*Math.PI*y/Math.pow(2,z);
+  return 180/Math.PI*Math.atan(0.5*(Math.exp(t)-Math.exp(-t)));
+}
+
+/* -------- Lectura de un trozo del archivo -------- */
+function mfSlice(blob,inicio,largo){
+  const trozo=blob.slice(inicio,inicio+largo);
+  if(trozo.arrayBuffer) return trozo.arrayBuffer();
+  // Safari antiguo: Blob.arrayBuffer() no existe
+  return new Promise((res,rej)=>{
+    const fr=new FileReader();
+    fr.onload=()=>res(fr.result); fr.onerror=()=>rej(fr.error);
+    fr.readAsArrayBuffer(trozo);
+  });
+}
+
+/* -------- Cabecera del archivo -------- */
+async function mfLeerCabecera(blob){
+  let ab=await mfSlice(blob,0,24);
+  const ini=new MfBuf(ab);
+  if(MF_UTF8.decode(ini.u8.subarray(0,20))!==MF_MAGIA)
+    throw new Error('El archivo no es un mapa Mapsforge (.map)');
+  ini.p=20;
+  const tamCabecera=ini.int();
+  if(!(tamCabecera>0 && tamCabecera<1024*1024)) throw new Error('Cabecera del .map ilegible');
+
+  const b=new MfBuf(await mfSlice(blob,24,tamCabecera));
+  const version=b.int();
+  if(version<3||version>5) throw new Error('Versión '+version+' de archivo .map no soportada');
+  b.long();                                   // tamaño declarado del archivo
+  const fecha=b.long();
+  const minLat=b.int()/1e6, minLon=b.int()/1e6, maxLat=b.int()/1e6, maxLon=b.int()/1e6;
+  b.ushort();                                 // tamaño de tesela (siempre 256)
+  b.str();                                    // proyección ("Mercator")
+  const flags=b.ubyte();
+  const depurar=!!(flags&0x80);
+  if(flags&0x40){ b.int(); b.int(); }         // posición inicial sugerida
+  if(flags&0x20) b.ubyte();                   // zoom inicial sugerido
+  if(flags&0x10) b.str();                     // idioma preferido
+  const comentario=(flags&0x08)?b.str():'';
+  if(flags&0x04) b.str();                     // creado por
+
+  const etqPoi=[], etqVia=[];
+  let n=b.ushort(); for(let i=0;i<n;i++) etqPoi.push(b.str());
+  n=b.ushort();     for(let i=0;i<n;i++) etqVia.push(b.str());
+
+  const intervalos=[];
+  const nIv=b.ubyte();
+  for(let i=0;i<nIv;i++){
+    const zBase=b.ubyte(), zMin=b.ubyte(), zMax=b.ubyte();
+    const inicio=b.long(), tam=b.long();
+    const tx0=mfLonATesela(minLon,zBase), tx1=mfLonATesela(maxLon,zBase);
+    const ty0=mfLatATesela(maxLat,zBase), ty1=mfLatATesela(minLat,zBase);
+    intervalos.push({zBase,zMin,zMax,inicio,tam,tx0,tx1,ty0,ty1,
+      ancho:tx1-tx0+1, alto:ty1-ty0+1,
+      indice:inicio+(depurar?16:0),      // los archivos "de depuración" meten una firma
+      cacheIdx:new Map()});
+  }
+  if(!intervalos.length) throw new Error('El archivo .map no contiene ningún nivel de zoom');
+  intervalos.sort((a,b2)=>a.zBase-b2.zBase);
+  return {blob, version, fecha, comentario, depurar,
+          bbox:[minLon,minLat,maxLon,maxLat], etqPoi, etqVia, intervalos};
+}
+
+/* Intervalo de zoom (sub-archivo) que corresponde a un nivel de zoom de pantalla */
+function mfIntervalo(mf,z){
+  for(const iv of mf.intervalos) if(z>=iv.zMin && z<=iv.zMax) return iv;
+  return z<mf.intervalos[0].zMin ? mf.intervalos[0] : mf.intervalos[mf.intervalos.length-1];
+}
+
+/* -------- Índice de teselas --------
+   5 bytes por tesela: el primer bit dice si es "tesela de mar" y los 39 restantes son
+   la posición donde empiezan sus datos, contada desde el principio del sub-archivo.
+   Se leen por bloques de 1024 entradas para no hacer una lectura de disco por tesela. */
+const MF_IDX_BLOQUE=1024;
+async function mfEntradaIndice(mf,iv,i){
+  const bloque=Math.floor(i/MF_IDX_BLOQUE);
+  let buf=iv.cacheIdx.get(bloque);
+  if(!buf){
+    const desde=bloque*MF_IDX_BLOQUE;
+    const cuantas=Math.min(MF_IDX_BLOQUE, iv.ancho*iv.alto-desde);
+    buf=new Uint8Array(await mfSlice(mf.blob, iv.indice+desde*5, cuantas*5));
+    iv.cacheIdx.set(bloque,buf);
+    if(iv.cacheIdx.size>64) iv.cacheIdx.delete(iv.cacheIdx.keys().next().value);
+  }
+  const o=(i-bloque*MF_IDX_BLOQUE)*5;
+  if(o+5>buf.length) return null;
+  // 39 bits: el primero es la bandera de mar y se descarta
+  return ((buf[o]&0x7f)*16777216 + buf[o+1]*65536 + buf[o+2]*256 + buf[o+3])*256 + buf[o+4];
+}
+
+/* Datos crudos de una tesela, o null si está vacía o fuera del mapa */
+async function mfDatosTesela(mf,iv,tx,ty){
+  if(tx<iv.tx0||tx>iv.tx1||ty<iv.ty0||ty>iv.ty1) return null;
+  const i=(ty-iv.ty0)*iv.ancho+(tx-iv.tx0);
+  const total=iv.ancho*iv.alto;
+  const ini=await mfEntradaIndice(mf,iv,i);
+  if(ini==null) return null;
+  const fin=(i+1<total) ? await mfEntradaIndice(mf,iv,i+1) : iv.tam;
+  if(fin==null || fin<=ini) return null;                 // tesela sin contenido
+  if(fin-ini>32*1024*1024) return null;                  // absurdo: índice corrupto
+  return mfSlice(mf.blob, iv.inicio+ini, fin-ini);
+}
+
+/* -------- Etiquetas OSM de un punto o una vía --------
+   Los identificadores apuntan a la lista de la cabecera ("highway=track"). Desde la
+   versión 5 el valor puede ser variable ("ele=%f"): entonces el valor de verdad viene
+   a continuación en el propio flujo de bytes y HAY que consumirlo, o todo lo que se lea
+   después queda desplazado y la tesela sale ilegible. */
+function mfLeerEtiquetas(b,lista,n){
+  const ids=[];
+  for(let i=0;i<n;i++) ids.push(b.vuint());
+  const t={};
+  for(let i=0;i<n;i++){
+    const cruda=lista[ids[i]];
+    if(cruda==null) continue;
+    const j=cruda.indexOf('=');
+    const clave=j<0?cruda:cruda.slice(0,j);
+    let valor=j<0?'yes':cruda.slice(j+1);
+    if(valor.length===2 && valor.charCodeAt(0)===37){    // '%'
+      const c=valor.charAt(1);
+      if(c==='b')      valor=String(b.byte());
+      else if(c==='i') valor=(clave.indexOf(':colour')>=0)?('#'+(b.int()>>>0).toString(16)):String(b.int());
+      else if(c==='f') valor=String(b.float());
+      else if(c==='h') valor=String(b.short());
+      else if(c==='s') valor=b.str();
+    }
+    t[clave]=valor;
+  }
+  return t;
+}
+
+/* Un mismo nombre puede venir en varios idiomas metidos en la misma cadena: el nombre
+   local suelto y detrás, separado por \r, un "idioma\bnombre" por cada traducción
+   ("Pica d'Estats\rfr\bPique d'Estats"). En campo interesa el local, que es el que va en
+   los carteles y en los mapas del monte. Algunos elementos no traen nombre local y sólo
+   dan traducciones: entonces se coge el castellano si está y, si no, la primera. */
+function mfNombre(s){
+  if(s.indexOf('\r')<0 && s.indexOf('\b')<0) return s;
+  const trozos=s.split('\r');
+  let alt=null;
+  for(const t of trozos){
+    const i=t.indexOf('\b');
+    if(i<0) return t;                       // sin código de idioma: es el nombre local
+    const idioma=t.slice(0,i), nombre=t.slice(i+1);
+    if(idioma==='es') return nombre;
+    if(alt===null) alt=nombre;
+  }
+  return alt||s;
+}
+
+/* -------- Una tesela entera: puntos y vías --------
+   Devuelve arrays de objetos sencillos {tags,nombre,capa,zoom,coords}. La conversión a
+   elementos de OpenLayers se hace aparte, para poder cambiarla sin tocar el lector. */
+function mfParsearTesela(mf,iv,tx,ty,ab,qz){
+  const b=new MfBuf(ab);
+  if(mf.depurar) b.saltar(32);
+  const filas=iv.zMax-iv.zMin+1;
+  const tabla=[];
+  let acPoi=0, acVia=0;
+  for(let i=0;i<filas;i++){ acPoi+=b.vuint(); acVia+=b.vuint(); tabla.push([acPoi,acVia]); }
+
+  /* Para esto está la tabla de zoom: dentro de la tesela los elementos van ordenados de
+     menos a más detalle, y la tabla dice cuántos hay acumulados hasta cada nivel. Así,
+     para dibujar a un zoom dado basta con leer los primeros y PARAR: a z12 una tesela
+     trae cuatro carreteras en vez de miles de caminos y edificios. Sin esto, alejarse un
+     par de niveles obligaba a leer entera media provincia y no daba tiempo a nada. */
+  const fila0=Math.max(0,Math.min(filas-1,(qz==null?iv.zMax:qz)-iv.zMin));
+  const nPoi=tabla[fila0][0], nVia=tabla[fila0][1];
+
+  let primeraVia=b.vuint(); primeraVia+=b.p;   // el desplazamiento es relativo a aquí
+
+  const latT=mfTeselaALat(ty,iv.zBase), lonT=mfTeselaALon(tx,iv.zBase);
+  const puntos=[], vias=[];
+
+  /* --- Puntos de interés --- */
+  let fila=0;
+  for(let i=0;i<nPoi;i++){
+    while(fila<filas-1 && i>=tabla[fila][0]) fila++;
+    if(mf.depurar) b.saltar(32);
+    const lat=latT+b.vint()/1e6, lon=lonT+b.vint()/1e6;
+    const esp=b.ubyte();
+    const tags=mfLeerEtiquetas(b,mf.etqPoi,esp&0x0f);
+    const fl=b.ubyte();
+    if(fl&0x80) tags.name=mfNombre(b.str());
+    if(fl&0x40) tags['addr:housenumber']=b.str();
+    if(fl&0x20) tags.ele=String(b.vint());
+    puntos.push({tags, capa:(esp>>4)-5, zoom:iv.zMin+fila, coord:[lon,lat]});
+  }
+
+  /* --- Vías (líneas y polígonos) --- */
+  b.p=primeraVia;
+  fila=0;
+  for(let i=0;i<nVia;i++){
+    while(fila<filas-1 && i>=tabla[fila][1]) fila++;
+    if(mf.depurar) b.saltar(32);
+    const tam=b.vuint();
+    const fin=b.p+tam;
+    if(fin>b.u8.length) break;                 // datos truncados: se deja lo leído
+    try{
+      b.saltar(2);                             // mapa de bits de sub-teselas (no se usa)
+      const esp=b.ubyte();
+      const tags=mfLeerEtiquetas(b,mf.etqVia,esp&0x0f);
+      const fl=b.ubyte();
+      if(fl&0x80) tags.name=mfNombre(b.str());
+      if(fl&0x40) tags['addr:housenumber']=b.str();
+      if(fl&0x20) tags.ref=mfNombre(b.str());
+      if(fl&0x10){ b.vint(); b.vint(); }       // posición sugerida para la etiqueta
+      const nBloques=(fl&0x08)?b.vuint():1;
+      const dobleDelta=!!(fl&0x04);
+      for(let k=0;k<nBloques;k++){
+        const anillos=[];
+        const nBloquesCoord=b.vuint();
+        for(let c=0;c<nBloquesCoord;c++){
+          const nNodos=b.vuint();
+          if(nNodos<2 || nNodos>200000){ b.p=fin; break; }
+          const pts=new Array(nNodos);
+          let lat=latT+b.vint()/1e6, lon=lonT+b.vint()/1e6;
+          pts[0]=[lon,lat];
+          if(dobleDelta){
+            let dLat=0, dLon=0;
+            for(let m=1;m<nNodos;m++){
+              dLat+=b.vint()/1e6; dLon+=b.vint()/1e6;
+              lat+=dLat; lon+=dLon;
+              pts[m]=[lon,lat];
+            }
+          }else{
+            for(let m=1;m<nNodos;m++){
+              lat+=b.vint()/1e6; lon+=b.vint()/1e6;
+              pts[m]=[lon,lat];
+            }
+          }
+          anillos.push(pts);
+        }
+        if(anillos.length) vias.push({tags, capa:(esp>>4)-5, zoom:iv.zMin+fila, anillos});
+      }
+    }catch(e){ /* una vía ilegible no debe tirar la tesela entera */ }
+    b.p=fin;
+  }
+  return {puntos, vias};
+}
+
+/* ===================== Estilo de dibujo =====================
+   Mapsforge no guarda colores: guarda etiquetas de OpenStreetMap y espera que quien
+   dibuje ponga su propio estilo. Éste está pensado para trabajo en monte, con las
+   pistas, sendas, cortafuegos y curvas de nivel por delante del resto. */
+
+/* Superficies. El número es el orden de dibujo: cuanto más alto, más arriba. */
+const MF_AREAS={
+  'landuse=residential':{r:'#e6e3e0',o:10}, 'landuse=industrial':{r:'#e4dbe2',o:10},
+  'landuse=commercial':{r:'#eee2e2',o:10},  'landuse=farmyard':{r:'#efd7c0',o:10},
+  'landuse=farmland':{r:'#eff0d6',o:11},    'landuse=quarry':{r:'#c9c3ba',o:11},
+  'landuse=brownfield':{r:'#c8c8b0',o:10},  'landuse=construction':{r:'#c8c8b0',o:10},
+  'landuse=retail':{r:'#f0dcd6',o:10},      'landuse=cemetery':{r:'#aacbaf',o:11},
+  'natural=bare_rock':{r:'#e0dcd4',o:11},   'natural=scree':{r:'#e6e1d9',o:11},
+  'landuse=forest':{r:'#c6e0b3',o:12},      'natural=wood':{r:'#c6e0b3',o:12},
+  'landuse=orchard':{r:'#dfe5b6',o:12},     'landuse=vineyard':{r:'#dfe5b6',o:12},
+  'natural=scrub':{r:'#d6e5bd',o:13},       'natural=heath':{r:'#e3e0c7',o:13},
+  'natural=grassland':{r:'#deecc8',o:13},   'landuse=meadow':{r:'#deecc8',o:13},
+  'landuse=grass':{r:'#deecc8',o:13},       'landuse=allotments':{r:'#dfe8bf',o:13},
+  'leisure=park':{r:'#cfeca8',o:14},        'leisure=garden':{r:'#cfeca8',o:14},
+  'natural=beach':{r:'#fff1ba',o:14},       'leisure=pitch':{r:'#aae0a1',o:15},
+  'natural=wetland':{r:'#c3dfd2',o:16},
+  'natural=water':{r:'#a5cfe0',b:'#7aa8c0',o:20},
+  'landuse=reservoir':{r:'#a5cfe0',b:'#7aa8c0',o:20},
+  'landuse=basin':{r:'#a5cfe0',b:'#7aa8c0',o:20},
+  'waterway=riverbank':{r:'#a5cfe0',b:'#7aa8c0',o:20},
+  'natural=glacier':{r:'#e0eef2',b:'#a8c8d4',o:20},
+  'aeroway=aerodrome':{r:'#e6e0e6',o:11}
+};
+/* Vías rodadas y caminos. c=color, w=grosor, d=trazo discontinuo, k=color del ribete */
+const MF_VIAS={
+  motorway:{c:'#e892a2',k:'#c06a7a',w:6,o:70},  motorway_link:{c:'#e892a2',k:'#c06a7a',w:4,o:69},
+  trunk:{c:'#f9b29c',k:'#c88a76',w:5.5,o:68},   trunk_link:{c:'#f9b29c',k:'#c88a76',w:4,o:67},
+  primary:{c:'#fcd6a4',k:'#c9a678',w:5,o:66},   primary_link:{c:'#fcd6a4',k:'#c9a678',w:3.5,o:65},
+  secondary:{c:'#f7fabf',k:'#bdc08c',w:4.5,o:64},secondary_link:{c:'#f7fabf',k:'#bdc08c',w:3.5,o:63},
+  tertiary:{c:'#ffffff',k:'#b8b8b8',w:4,o:62},  tertiary_link:{c:'#ffffff',k:'#b8b8b8',w:3,o:61},
+  unclassified:{c:'#ffffff',k:'#bcbcbc',w:3.5,o:60},
+  residential:{c:'#ffffff',k:'#bcbcbc',w:3.5,o:60},
+  living_street:{c:'#ededed',k:'#bcbcbc',w:3,o:59},
+  pedestrian:{c:'#ededed',k:'#bcbcbc',w:3,o:59},
+  service:{c:'#ffffff',k:'#c8c8c8',w:2.2,o:58},
+  /* Lo que de verdad importa en campo */
+  track:{c:'#a3701f',w:2.6,d:[9,4],o:56},
+  bridleway:{c:'#3d8a4e',w:2.2,d:[7,4],o:55},
+  path:{c:'#8a5a3c',w:2,d:[5,4],o:54},
+  footway:{c:'#a06a5a',w:1.8,d:[5,4],o:54},
+  cycleway:{c:'#4a5ba0',w:1.8,d:[6,4],o:54},
+  steps:{c:'#a06a5a',w:3.4,d:[2,2.6],o:54},
+  construction:{c:'#cccccc',w:2.5,d:[6,4],o:52},
+  raceway:{c:'#ffc0cb',w:2.5,o:52}
+};
+const MF_AGUA={ river:{w:2.8}, stream:{w:1.6}, canal:{w:2.4}, drain:{w:1.1}, ditch:{w:1.1} };
+
+/* Puntos que merece la pena enseñar, con su icono */
+const MF_PUNTOS={
+  'natural=peak':'▲', 'natural=saddle':'⌣', 'natural=spring':'💧', 'natural=cave_entrance':'⌂',
+  'amenity=shelter':'⌂', 'amenity=drinking_water':'💧', 'amenity=fire_station':'🚒',
+  'amenity=parking':'P', 'amenity=fuel':'⛽', 'amenity=restaurant':'🍴', 'amenity=hospital':'✚',
+  'tourism=viewpoint':'👁', 'tourism=picnic_site':'🧺', 'tourism=alpine_hut':'⌂',
+  'tourism=information':'i', 'man_made=tower':'🗼', 'man_made=water_tower':'🗼',
+  'emergency=fire_hydrant':'🚰', 'historic=ruins':'⌂', 'amenity=place_of_worship':'✝'
+};
+/* Zoom mínimo al que aparece el nombre de cada tipo de núcleo de población */
+const MF_LUGARES={ city:8, town:10, village:12, hamlet:13, isolated_dwelling:14,
+                   suburb:12, locality:14, farm:14, neighbourhood:14 };
+
+/* Etiquetas que hacen que una vía cerrada sea una superficie y no una línea */
+function mfEsArea(t,anillo){
+  if(t.area==='no') return false;
+  if(t.highway||t.barrier||t.railway||t.power) return false;
+  if(t.waterway && t.waterway!=='riverbank' && t.waterway!=='dock') return false;
+  if(t.building||t['building:part']) return true;
+  if(t.area==='yes') return true;
+  if(t.landuse||t.leisure||t.amenity||t.natural||t.place||t.aeroway||t.man_made||t.boundary==='protected_area') {
+    // "natural=tree_row" o "natural=cliff" son lineales aunque lleven natural=
+    if(t.natural==='cliff'||t.natural==='tree_row'||t.natural==='ridge'||t.natural==='arete') return false;
+    const p=anillo[0], u=anillo[anillo.length-1];
+    return anillo.length>3 && Math.abs(p[0]-u[0])<1e-7 && Math.abs(p[1]-u[1])<1e-7;
+  }
+  return false;
+}
+
+/* Clasifica una vía y devuelve {clave,o,z} — clave identifica el estilo (y sirve de
+   clave de caché), o es el orden de dibujo y z el zoom mínimo para verla. */
+function mfClaseVia(t,area){
+  /* Mapsforge pinta el fondo de CADA tesela con un rectángulo de mar (natural=sea) y le
+     superpone la forma de la tierra (natural=nosea). Los dos sobran aquí: esta capa se
+     dibuja ENCIMA del mapa de fondo (ortofoto, IGN…) y cualquiera de los dos rellenos lo
+     taparía entero — dibujar sólo el de mar dejaba cuadros azules sobre el monte. El
+     agua de verdad ya viene aparte (natural=water, waterway…) y del mar se encarga el
+     mapa de fondo, que se sigue viendo por debajo. */
+  if(t.natural==='nosea'||t.natural==='land'||t.natural==='sea') return null;
+  if(area){
+    if(t.building||t['building:part']) return {clave:'a|edificio',o:30,z:15};
+    for(const k in MF_AREAS){
+      const j=k.indexOf('=');
+      if(t[k.slice(0,j)]===k.slice(j+1)) return {clave:'a|'+k,o:MF_AREAS[k].o,z:0};
+    }
+    if(t['piste:type']) return {clave:'a|pista_esqui',o:17,z:12};
+    if(t.leisure) return {clave:'a|leisure',o:15,z:13};
+    if(t.tourism||t.historic) return {clave:'a|amenity',o:15,z:14};
+    if(t.amenity) return {clave:'a|amenity',o:15,z:14};
+    return null;
+  }
+  if(t['piste:type']&&!t.highway) return {clave:'v|pista_esqui',o:53,z:12};
+  if(t.highway){
+    const v=MF_VIAS[t.highway];
+    if(v) return {clave:'v|'+t.highway,o:v.o,z:0};
+    return {clave:'v|otra',o:50,z:14};
+  }
+  /* Curvas de nivel. Las traen los mapas de OpenAndroMaps (contour_ext) y los mapas
+     generados con datos de altimetría (contour=elevation). */
+  if(t.contour_ext||t.contour||(t.ele&&!t.building)){
+    const mayor=/major/.test(t.contour_ext||'')||(t.contour_ext===undefined&&t.contour==='elevation'&&(parseFloat(t.ele)%100===0));
+    return {clave:mayor?'n|mayor':'n|menor',o:18,z:13};
+  }
+  if(t.waterway) return {clave:'w|'+(MF_AGUA[t.waterway]?t.waterway:'stream'),o:22,z:0};
+  if(t.railway) return {clave:'r|tren',o:45,z:11};
+  if(t.aerialway) return {clave:'r|cable',o:44,z:13};
+  if(t.power==='line') return {clave:'p|linea',o:43,z:13};
+  if(t.power==='minor_line') return {clave:'p|linea2',o:43,z:14};
+  if(t.natural==='cliff'||t.natural==='arete'||t.natural==='ridge') return {clave:'g|risco',o:19,z:13};
+  if(t.natural==='tree_row') return {clave:'g|seto',o:19,z:14};
+  if(t.barrier) return {clave:'g|cierre',o:19,z:15};
+  if(t.boundary==='administrative') return {clave:'b|admin',o:40,z:9};
+  if(t.boundary) return {clave:'b|otro',o:39,z:12};
+  if(t.route) return null;              // relaciones de ruta: se saltan
+  return null;
+}
+
+/* Estilos ya construidos, cacheados por clave: una capa puede tener decenas de miles de
+   elementos y crear un ol.style.Style por elemento y por refresco iría muy lento. */
+const mfCacheEstilos=new Map();
+function mfEstiloDe(clave){
+  let s=mfCacheEstilos.get(clave);
+  if(s!==undefined) return s;
+  const tipo=clave.charAt(0), id=clave.slice(2);
+  const linea=(c,w,d,tapa)=>new ol.style.Style({stroke:new ol.style.Stroke({color:c,width:w,lineDash:d||null,lineCap:tapa||'round',lineJoin:'round'})});
+  if(tipo==='i'){
+    s = id ? [new ol.style.Style({text:new ol.style.Text({
+          text:id, font:'13px system-ui,sans-serif',
+          fill:new ol.style.Fill({color:'#5a4636'}),
+          stroke:new ol.style.Stroke({color:'#ffffff',width:2.5})})})]
+      : null;                                   // sólo topónimo, sin icono
+  }else if(tipo==='a'){
+    if(id==='edificio')      s=[new ol.style.Style({fill:new ol.style.Fill({color:'#d9cfc6'}),stroke:new ol.style.Stroke({color:'#bfb0a2',width:.7})})];
+    else if(id==='pista_esqui') s=[new ol.style.Style({fill:new ol.style.Fill({color:'rgba(180,215,235,.45)'})})];
+    else if(id==='leisure')  s=[new ol.style.Style({fill:new ol.style.Fill({color:'#dff0d0'})})];
+    else if(id==='amenity')  s=[new ol.style.Style({fill:new ol.style.Fill({color:'#eee5da'})})];
+    else{
+      const d=MF_AREAS[id]||{r:'#e8e8e8'};
+      s=[new ol.style.Style({fill:new ol.style.Fill({color:d.r}),
+        stroke:d.b?new ol.style.Stroke({color:d.b,width:.9}):null})];
+    }
+  }else if(tipo==='v'){
+    if(id==='pista_esqui'){ s=[linea('#6aa6c8',2,[10,5])]; mfCacheEstilos.set(clave,s); return s; }
+    const d=MF_VIAS[id]||{c:'#dcdcdc',w:2};
+    s=d.k ? [linea(d.k,d.w+1.6,null,'round'), linea(d.c,d.w,d.d)] : [linea(d.c,d.w,d.d)];
+  }else if(tipo==='w'){
+    s=[linea('#8fc4dc',(MF_AGUA[id]||{w:1.6}).w)];
+  }else if(tipo==='n'){
+    s=[linea('#c0925e', id==='mayor'?1.1:0.6)];
+  }else if(tipo==='r'){
+    s = id==='tren' ? [linea('#6b6b6b',2.6),linea('#ffffff',1.4,[7,7],'butt')]
+                    : [linea('#6b6b6b',1.2,[8,4])];
+  }else if(tipo==='p'){
+    s=[linea('#a0a0a0', id==='linea'?1.1:0.8,[10,5])];
+  }else if(tipo==='g'){
+    s = id==='risco' ? [linea('#8a7c6a',1.4,[6,3])]
+      : id==='seto'  ? [linea('#7ea86a',1.6,[3,3])]
+                     : [linea('#9c9c9c',0.9,[4,3])];
+  }else if(tipo==='b'){
+    s=[linea(id==='admin'?'#9b59b6':'#b08bc4', id==='admin'?1.6:1.1,[8,3,2,3])];
+  }else s=null;
+  mfCacheEstilos.set(clave,s);
+  return s;
+}
+
+/* Textos: se cachean por (tipo de texto + nombre) */
+const mfCacheTextos=new Map();
+function mfTexto(clase,txt){
+  const k=clase+' '+txt;
+  let s=mfCacheTextos.get(k);
+  if(s) return s;
+  const cfg={
+    lugarGrande:{f:'bold 15px system-ui,sans-serif',c:'#3a3a3a',h:'#ffffff',hw:3.5},
+    lugar:      {f:'bold 12px system-ui,sans-serif',c:'#4a4a4a',h:'#ffffff',hw:3},
+    punto:      {f:'11px system-ui,sans-serif',c:'#4a4a4a',h:'#ffffff',hw:3,dy:13},
+    agua:       {f:'italic 11px system-ui,sans-serif',c:'#3f7d99',h:'#ffffff',hw:3},
+    via:        {f:'11px system-ui,sans-serif',c:'#4a4a4a',h:'#ffffff',hw:3,linea:true},
+    curva:      {f:'9px system-ui,sans-serif',c:'#a37a4a',h:'#ffffff',hw:2.5,linea:true}
+  }[clase]||{f:'11px system-ui,sans-serif',c:'#444',h:'#fff',hw:3};
+  s=new ol.style.Style({text:new ol.style.Text({
+    text:txt, font:cfg.f, placement:cfg.linea?'line':'point',
+    offsetY:cfg.dy||0, overflow:!cfg.linea,
+    fill:new ol.style.Fill({color:cfg.c}),
+    stroke:new ol.style.Stroke({color:cfg.h,width:cfg.hw})
+  })});
+  mfCacheTextos.set(k,s);
+  if(mfCacheTextos.size>4000) mfCacheTextos.clear();
+  return s;
+}
+
+/* Zoom "de mapa web" equivalente a una resolución de la vista. La vista va en UTM 30N
+   (metros reales) y los niveles de zoom de Mercator se miden en el ecuador, así que hay
+   que corregir por la latitud. */
+let mfCosLat=Math.cos(41*Math.PI/180);
+function mfActualizarCosLat(){
+  try{
+    const c=ol.proj.transform(view.getCenter(),P30,GEO);
+    if(c && isFinite(c[1])) mfCosLat=Math.max(0.05,Math.cos(c[1]*Math.PI/180));
+  }catch(e){}
+}
+function mfZoomDeResolucion(res){ return Math.log2(156543.03392804097*mfCosLat/res); }
+function mfZoomVista(){ return Math.round(mfZoomDeResolucion(view.getResolution())); }
+
+/* Estilo de un elemento. Se llama en cada refresco y para cada elemento visible, así que
+   no puede crear nada: todo lo caro (clasificar las etiquetas) se hizo al leer la tesela
+   y aquí sólo se elige entre el estilo con nombre y el estilo sin él, ambos cacheados. */
+function mfEstiloFn(f,res){
+  const z=mfZoomDeResolucion(res);
+  if(z<f.get('zmin')) return null;
+  const etq=f.get('etq');
+  if(etq && z>=f.get('ztxt')){
+    if(f.mfConTexto===undefined){
+      const base=mfEstiloDe(f.get('clave'));
+      const txt=mfTexto(f.get('tetq'),etq);
+      f.mfConTexto = base ? base.concat([txt]) : [txt];
+    }
+    return f.mfConTexto;
+  }
+  return mfEstiloDe(f.get('clave'));
+}
+
+/* -------- De los datos leídos a elementos de OpenLayers -------- */
+function mfProyectar(pts){
+  const out=new Array(pts.length);
+  for(let i=0;i<pts.length;i++) out[i]=ol.proj.fromLonLat(pts[i],P30);
+  return out;
+}
+function mfElementosDeTesela(datos){
+  const feats=[];
+  datos.vias.forEach(v=>{
+    const t=v.tags;
+    const area=mfEsArea(t,v.anillos[0]);
+    const cl=mfClaseVia(t,area);
+    if(!cl) return;
+    let geom;
+    if(area){
+      geom=new ol.geom.Polygon(v.anillos.map(mfProyectar));
+    }else{
+      geom = v.anillos.length>1
+        ? new ol.geom.MultiLineString(v.anillos.map(mfProyectar))
+        : new ol.geom.LineString(mfProyectar(v.anillos[0]));
+    }
+    const f=new ol.Feature(geom);
+    f.set('clave',cl.clave,true);
+    f.set('o',cl.o+(v.capa||0)*0.01,true);
+    f.set('zmin',Math.max(cl.z,v.zoom),true);
+    f.set('tags',t,true);
+    if(t.name){
+      f.set('etq',t.name,true);
+      if(t.highway){        f.set('tetq','via',true);  f.set('ztxt',15,true); }
+      else if(t.waterway||t.natural==='water'||t.landuse==='reservoir'){ f.set('tetq','agua',true); f.set('ztxt',13,true); }
+      /* El nombre de cada edificio sólo a partir de z17: en un casco urbano son cientos y
+         tapaban los topónimos y los caminos, que es lo que interesa ver en campo. */
+      else if(cl.clave==='a|edificio'){ f.set('tetq','lugar',true); f.set('ztxt',17,true); }
+      else if(area){        f.set('tetq','lugar',true); f.set('ztxt',14,true); }
+      else{                 f.set('tetq','via',true);  f.set('ztxt',15,true); }
+    }else if(cl.clave==='n|mayor' && t.ele){
+      f.set('etq',t.ele,true); f.set('tetq','curva',true); f.set('ztxt',15,true);
+    }
+    feats.push(f);
+  });
+  datos.puntos.forEach(p=>{
+    const t=p.tags;
+    let icono=null, etq=t.name||null, tetq='punto', ztxt=15, zmin=Math.max(p.zoom,15), orden=90;
+    if(t.place && MF_LUGARES[t.place]!==undefined){
+      if(!etq) return;
+      const zl=MF_LUGARES[t.place];
+      zmin=Math.max(p.zoom-1,zl); ztxt=zl; orden=95;
+      tetq=(t.place==='city'||t.place==='town')?'lugarGrande':'lugar';
+    }else{
+      let k=null;
+      for(const c in MF_PUNTOS){ const j=c.indexOf('='); if(t[c.slice(0,j)]===c.slice(j+1)){ k=c; break; } }
+      if(!k) return;
+      icono=MF_PUNTOS[k];
+      if(t.natural==='peak'){ zmin=Math.max(p.zoom,12); ztxt=12; if(t.ele) etq=(etq?etq+' ':'')+t.ele+' m'; }
+      if(!etq && !icono) return;
+    }
+    const f=new ol.Feature(new ol.geom.Point(ol.proj.fromLonLat(p.coord,P30)));
+    f.set('clave', icono?('i|'+icono):'i|', true);
+    f.set('o',orden,true);
+    f.set('zmin',zmin,true);
+    f.set('tags',t,true);
+    if(etq){ f.set('etq',etq,true); f.set('tetq',tetq,true); f.set('ztxt',ztxt,true); }
+    feats.push(f);
+  });
+  return feats;
+}
+/* ===================== Capa y carga por teselas =====================
+   OpenLayers no sabe reproyectar teselas vectoriales, y la vista de esta aplicación va
+   en UTM 30N, así que las teselas de Mapsforge (que son de Mercator) no se pueden
+   enchufar a un ol.source.VectorTile. Se hace a mano: al terminar cada movimiento del
+   mapa se mira qué teselas hacen falta, se leen las que aún no estén y se van añadiendo
+   sus elementos a un ol.source.Vector normal, ya con las coordenadas en UTM. */
+/* Tope de teselas por vista. Alejarse un nivel dentro de un mismo intervalo cuadruplica
+   las teselas que hacen falta (a z12 con zoom base 14 son unas cuantas centenas), pero a
+   esos niveles cada tesela se lee de un bocado gracias a la tabla de zoom, así que sale
+   a cuenta. El tope está para que un alejón hasta ver medio país no deje la aplicación
+   masticando teselas durante un minuto. */
+const MF_MAX_TESELAS=260;
+const MF_MAX_GUARDADAS=320;   // teselas que se conservan antes de tirar las más lejanas
+
+function mfCrearCapa(){
+  const source=new ol.source.Vector({wrapX:false});
+  return new ol.layer.Vector({
+    source, style:mfEstiloFn, declutter:true,
+    properties:{mapsforge:true}, zIndex:2, className:'ol-base-layer',
+    renderBuffer:180, updateWhileAnimating:false, updateWhileInteracting:false,
+    renderOrder:(a,b)=>(a.get('o')-b.get('o'))
+  });
+}
+
+async function mfCargarVista(entry){
+  if(!entry || !entry.layer.getVisible()) return;
+  /* Si ya se está leyendo, se apunta que hay que repasar la vista al terminar: si no,
+     un desplazamiento durante la carga dejaría la zona nueva sin dibujar hasta el
+     siguiente movimiento. */
+  if(entry.cargando){ entry.pendiente=true; return; }
+  const mf=entry.mf;
+  mfActualizarCosLat();
+  const z=mfZoomVista();
+  const iv=mfIntervalo(mf,z);
+  /* Nivel de detalle con el que se leen las teselas. Al cambiar (de sub-archivo o de
+     nivel dentro del mismo) hay que releerlas: las que ya están tienen otro detalle. */
+  const qz=Math.max(iv.zMin,Math.min(iv.zMax,z));
+  if(entry.iv!==iv || entry.qz!==qz){
+    entry.iv=iv; entry.qz=qz; entry.teselas.clear(); entry.layer.getSource().clear(true);
+  }
+  const ext=view.calculateExtent(map.getSize());
+  let geo;
+  try{ geo=ol.proj.transformExtent(ext,P30,GEO); }catch(e){ return; }
+  const x0=mfLonATesela(geo[0],iv.zBase), x1=mfLonATesela(geo[2],iv.zBase);
+  const y0=mfLatATesela(geo[3],iv.zBase), y1=mfLatATesela(geo[1],iv.zBase);
+  const nuevas=[];
+  for(let y=y0;y<=y1;y++) for(let x=x0;x<=x1;x++){
+    const k=x+'/'+y;
+    if(!entry.teselas.has(k)) nuevas.push([x,y,k]);
+  }
+  if(!nuevas.length) return;
+  if((x1-x0+1)*(y1-y0+1)>MF_MAX_TESELAS){
+    if(!entry.avisado){ entry.avisado=true; toast('Acércate un poco para ver "'+entry.meta.name+'"'); }
+    return;
+  }
+  entry.avisado=false;
+  entry.cargando=true; entry.pendiente=false;
+  const source=entry.layer.getSource();
+  let completa=true, hechas=0;
+  try{
+    for(const [x,y,k] of nuevas){
+      if(entry.teselas.has(k)) continue;
+      entry.teselas.set(k,null);                       // reserva el sitio
+      let feats=[];
+      try{
+        const ab=await mfDatosTesela(mf,iv,x,y);
+        if(ab) feats=mfElementosDeTesela(mfParsearTesela(mf,iv,x,y,ab,qz));
+      }catch(e){ console.warn('[.map] tesela ilegible',k,e); }
+      entry.teselas.set(k,feats);
+      if(feats.length) source.addFeatures(feats);
+      /* Un respiro cada pocas teselas para que la aplicación siga respondiendo mientras
+         carga. Cada 8 y no en cada una: leer una tesela son décimas de milisegundo, pero
+         el navegador redondea a unos 4 ms cualquier setTimeout(0) encadenado, así que
+         parar en todas costaba bastante más que el propio trabajo. */
+      if((++hechas & 7)===0) await new Promise(r=>setTimeout(r,0));
+      if(entry.iv!==iv||entry.qz!==qz){ completa=false; break; }   // el usuario ha cambiado el zoom
+    }
+  }finally{ entry.cargando=false; }
+  if(completa) mfPodar(entry,x0,x1,y0,y1);
+  if(entry.pendiente){ entry.pendiente=false; mfCargarVista(entry); }
+}
+
+/* Tira las teselas más alejadas de la vista cuando se acumulan demasiadas */
+function mfPodar(entry,x0,x1,y0,y1){
+  if(entry.teselas.size<=MF_MAX_GUARDADAS) return;
+  const cx=(x0+x1)/2, cy=(y0+y1)/2;
+  const lista=[];
+  entry.teselas.forEach((feats,k)=>{
+    const p=k.split('/');
+    lista.push({k,feats,d:Math.abs(+p[0]-cx)+Math.abs(+p[1]-cy)});
+  });
+  lista.sort((a,b)=>b.d-a.d);
+  const source=entry.layer.getSource();
+  const sobran=entry.teselas.size-MF_MAX_GUARDADAS;
+  for(let i=0;i<sobran;i++){
+    const it=lista[i];
+    if(it.d<=1) break;                       // nunca las de la propia vista
+    if(it.feats) it.feats.forEach(f=>{ try{source.removeFeature(f);}catch(e){} });
+    entry.teselas.delete(it.k);
+  }
+}
+
+/* ===================== Guardado en la tableta ===================== */
+const MF_DB_NAME='rangerViewerMapsforgeDB', MF_DB_VERSION=1;
+let mfIdbPromise=null;
+function openMfDb(){
+  if(mfIdbPromise) return mfIdbPromise;
+  mfIdbPromise=new Promise((resolve,reject)=>{
+    if(!window.indexedDB){ reject(new Error('IndexedDB no disponible en este navegador')); return; }
+    const req=indexedDB.open(MF_DB_NAME,MF_DB_VERSION);
+    req.onupgradeneeded=()=>{
+      const db=req.result;
+      if(!db.objectStoreNames.contains('meta'))  db.createObjectStore('meta',{keyPath:'id'});
+      if(!db.objectStoreNames.contains('blobs')) db.createObjectStore('blobs',{keyPath:'id'});
+    };
+    req.onsuccess=()=>resolve(req.result);
+    req.onerror=()=>reject(req.error||new Error('No se pudo abrir el almacén local'));
+  });
+  return mfIdbPromise;
+}
+/* El archivo se guarda como Blob, no como ArrayBuffer: así el navegador puede dejarlo en
+   disco y leerlo a trozos, en vez de tener que traérselo entero a memoria. */
+async function mfGuardar(meta,blob){
+  const db=await openMfDb();
+  const tx=db.transaction(['meta','blobs'],'readwrite');
+  await idbReq(tx.objectStore('meta').put(meta));
+  await idbReq(tx.objectStore('blobs').put({id:meta.id,data:blob}));
+}
+async function mfCargarMetas(){
+  const db=await openMfDb();
+  return idbReq(db.transaction('meta','readonly').objectStore('meta').getAll());
+}
+async function mfCargarBlob(id){
+  const db=await openMfDb();
+  const rec=await idbReq(db.transaction('blobs','readonly').objectStore('blobs').get(id));
+  return rec?rec.data:null;
+}
+async function mfBorrarArchivo(id){
+  const db=await openMfDb();
+  const tx=db.transaction(['meta','blobs'],'readwrite');
+  await idbReq(tx.objectStore('meta').delete(id));
+  await idbReq(tx.objectStore('blobs').delete(id));
+}
+
+/* ===================== Lista, encendido y apagado ===================== */
+let mfMetaList=[];
+const mfCapas={};                                  // id → {layer,mf,meta,teselas,iv}
+const mfCargandoCapa={};
+const mfList=document.getElementById('mfList');
+const MF_ON_KEY='rvv21_mapActivos';
+let mfActivos=[];
+try{ const v=JSON.parse(localStorage.getItem(MF_ON_KEY)||'[]'); if(Array.isArray(v)) mfActivos=v; }catch(e){}
+function guardarMfActivos(){ try{ localStorage.setItem(MF_ON_KEY,JSON.stringify(mfActivos)); }catch(e){} }
+
+async function ensureMfLayer(id){
+  if(mfCapas[id]) return mfCapas[id];
+  if(mfCargandoCapa[id]) return mfCargandoCapa[id];
+  mfCargandoCapa[id]=(async()=>{
+    const meta=mfMetaList.find(m=>m.id===id);
+    const blob=await mfCargarBlob(id);
+    if(!meta||!blob) throw new Error('No se encontró el mapa .map guardado');
+    const mf=await mfLeerCabecera(blob);
+    const layer=mfCrearCapa();
+    layer.setOpacity(typeof baseOpacidad==='number'?baseOpacidad:1);
+    map.addLayer(layer);
+    const entry={layer,mf,meta,teselas:new Map(),iv:null,cargando:false,avisado:false};
+    mfCapas[id]=entry;
+    return entry;
+  })();
+  try{ return await mfCargandoCapa[id]; }
+  finally{ delete mfCargandoCapa[id]; }
+}
+
+async function mostrarMf(id,on){
+  if(on){
+    let entry=mfCapas[id];
+    if(!entry){
+      toast('Abriendo mapa vectorial…');
+      try{ entry=await ensureMfLayer(id); }
+      catch(e){ console.error(e); toast('No se pudo abrir el mapa .map'); return null; }
+    }
+    entry.layer.setVisible(true);
+    if(mfActivos.indexOf(id)<0) mfActivos.push(id);
+    guardarMfActivos(); renderMfList();
+    mfCargarVista(entry);
+    return entry;
+  }
+  const entry=mfCapas[id];
+  if(entry) entry.layer.setVisible(false);
+  mfActivos=mfActivos.filter(x=>x!==id);
+  guardarMfActivos(); renderMfList();
+  return entry;
+}
+
+/* Encuadra la vista sobre el recuadro que abarca el mapa */
+function irAlMapsforge(entry,soloSiFuera){
+  const bb=entry.mf?entry.mf.bbox:(entry.meta&&entry.meta.bbox);
+  if(!bb) return;
+  let ext;
+  try{ ext=ol.proj.transformExtent([bb[0],bb[1],bb[2],bb[3]],GEO,P30); }catch(e){ return; }
+  if(ol.extent.isEmpty(ext)) return;
+  if(soloSiFuera && ol.extent.intersects(ext,view.calculateExtent(map.getSize()))) return;
+  view.fit(ext,{maxZoom:14,duration:400,padding:[70,70,220,70]});
+}
+
+function renderMfList(){
+  if(!mfList) return;
+  mfList.textContent='';
+  if(!mfMetaList.length){
+    const p=document.createElement('p'); p.className='hint';
+    p.textContent='Todavía no has importado ningún mapa vectorial .map.';
+    mfList.appendChild(p); return;
+  }
+  mfMetaList.forEach(m=>{
+    const encendido=mfActivos.indexOf(m.id)>=0;
+    const fila=document.createElement('div');
+    fila.className='baseopt'+(encendido?' active':'');
+    fila.style.justifyContent='space-between';
+
+    const izq=document.createElement('div');
+    izq.style.cssText='display:flex;align-items:center;gap:10px;min-width:0;flex:1;cursor:pointer';
+    const chk=document.createElement('input');
+    chk.type='checkbox'; chk.checked=encendido;
+    chk.style.cssText='width:20px;height:20px;accent-color:var(--rojo);flex:0 0 auto;pointer-events:none';
+    const ico=document.createElement('div');
+    ico.className='dot';
+    ico.style.cssText='display:flex;align-items:center;justify-content:center;font-size:18px;background:#f0f4f0';
+    ico.textContent='🗺️';
+    const nom=document.createElement('span');
+    // textContent: el nombre viene del archivo, que es de terceros
+    nom.style.cssText='overflow:hidden;text-overflow:ellipsis;white-space:nowrap';
+    nom.textContent=m.name;
+    izq.appendChild(chk); izq.appendChild(ico); izq.appendChild(nom);
+    izq.onclick=()=>mostrarMf(m.id,!encendido);
+    fila.appendChild(izq);
+
+    const der=document.createElement('span');
+    der.style.whiteSpace='nowrap';
+    const boton=(txt,titulo)=>{
+      const b=document.createElement('button');
+      b.textContent=txt; b.title=titulo;
+      b.style.cssText='flex:0 0 auto;border:1px solid var(--borde);background:var(--gris-bg);border-radius:8px;padding:6px 9px;font-size:13px;cursor:pointer;margin-left:6px';
+      der.appendChild(b); return b;
+    };
+    boton('🔍','Llevar la vista hasta este mapa').onclick=async e=>{
+      e.stopPropagation();
+      const entry=await mostrarMf(m.id,true);
+      if(entry){ irAlMapsforge(entry,false); closeSheets(); }
+    };
+    boton('🗑️','Eliminar este mapa del dispositivo').onclick=e=>{
+      e.stopPropagation(); borrarMapsforge(m.id);
+    };
+    fila.appendChild(der);
+    mfList.appendChild(fila);
+  });
+}
+
+async function borrarMapsforge(id){
+  if(!confirm('¿Eliminar este mapa vectorial del dispositivo? Esta acción no se puede deshacer.')) return;
+  const entry=mfCapas[id];
+  if(entry){ map.removeLayer(entry.layer); delete mfCapas[id]; }
+  mfMetaList=mfMetaList.filter(m=>m.id!==id);
+  try{ await mfBorrarArchivo(id); }catch(e){}
+  mfActivos=mfActivos.filter(x=>x!==id);
+  guardarMfActivos(); renderMfList();
+  toast('Mapa vectorial eliminado');
+}
+
+/* La transparencia del mapa de fondo se aplica también a estos mapas, igual que a los
+   MBTiles: tapan el fondo, así que difuminar sólo lo de debajo no serviría de nada.
+   El try/catch NO sobra: aplicarBaseOpacidad() se ejecuta al arrancar, bastante más
+   arriba en este mismo script, cuando `const mfCapas` todavía no se ha evaluado. La
+   declaración está en su "zona muerta", y leerla —incluso con typeof— lanza un
+   ReferenceError que, al saltar en el nivel superior del script, abortaba TODO lo que
+   viene después: la aplicación se quedaba sin la mitad de sus funciones. */
+function mfAplicarOpacidad(op){
+  try{ Object.values(mfCapas).forEach(en=>en.layer.setOpacity(op)); }
+  catch(e){ /* todavía no hay mapas vectoriales cargados */ }
+}
+
+/* Cuando el mapa se mueve o cambia de zoom se piden las teselas que falten.
+   No basta con escuchar 'moveend': OpenLayers no lo lanza siempre que se cambia la vista
+   por código (view.setZoom, ir a unas coordenadas, encuadrar un elemento…), y entonces
+   la capa se quedaba con el nivel de detalle del zoom anterior. Se escucha también a la
+   propia vista, con un pequeño retardo para no dispararlo en cada fotograma de un
+   desplazamiento o de un pellizco de zoom. */
+let mfRepasoTimer=null;
+function mfRepasarVista(){
+  if(mfRepasoTimer) clearTimeout(mfRepasoTimer);
+  mfRepasoTimer=setTimeout(()=>{
+    mfRepasoTimer=null;
+    Object.keys(mfCapas).forEach(id=>{
+      const en=mfCapas[id];
+      if(en && en.layer.getVisible()) mfCargarVista(en);
+    });
+  },220);
+}
+map.on('moveend',mfRepasarVista);
+view.on('change:center',mfRepasarVista);
+view.on('change:resolution',mfRepasarVista);
+
+/* ===================== Importar un archivo .map ===================== */
+const bMfImport=document.getElementById('bMfImport');
+if(bMfImport){
+  bMfImport.onclick=()=>document.getElementById('mfImportFile').click();
+  document.getElementById('mfImportFile').onchange=async e=>{
+    const file=e.target.files && e.target.files[0];
+    e.target.value='';
+    if(!file) return;
+    const info=document.getElementById('mfImportInfo');
+    info.textContent='Leyendo el mapa… ('+(file.size/1048576).toFixed(0)+' MB)';
+    try{
+      const mf=await mfLeerCabecera(file);          // valida el archivo y saca el recuadro
+      const id='v'+Date.now()+'_'+Math.round(Math.random()*9999);
+      const meta={id,
+        name:(file.name.replace(/\.(osm\.)?map$/i,'')||'Mapa vectorial').trim(),
+        size:file.size, bbox:mf.bbox, version:mf.version, addedAt:Date.now()};
+      info.textContent='Guardando en el dispositivo…';
+      await mfGuardar(meta,file);
+      mfMetaList.push(meta);
+      const layer=mfCrearCapa();
+      layer.setOpacity(typeof baseOpacidad==='number'?baseOpacidad:1);
+      map.addLayer(layer);
+      const entry={layer,mf,meta,teselas:new Map(),iv:null,cargando:false,avisado:false};
+      mfCapas[id]=entry;
+      if(mfActivos.indexOf(id)<0) mfActivos.push(id);
+      guardarMfActivos(); renderMfList();
+      info.textContent='';
+      toast('Mapa "'+meta.name+'" importado');
+      irAlMapsforge(entry,false);
+      mfCargarVista(entry);
+      closeSheets();
+    }catch(err){
+      console.error(err);
+      info.textContent='Error: '+(err && err.message ? err.message : 'no se pudo importar el archivo');
+    }
+  };
+}
+
+/* Al arrancar: sólo la lista (los archivos no se abren hasta que se encienden) */
+(async function initMapsforge(){
+  try{ mfMetaList=await mfCargarMetas(); }
+  catch(e){ console.error('Mapsforge init',e); mfMetaList=[]; }
+  const guardados=new Set(mfMetaList.map(m=>m.id));
+  mfActivos=mfActivos.filter(id=>guardados.has(id));
+  guardarMfActivos();
+  renderMfList();
+  for(const id of mfActivos.slice()) await mostrarMf(id,true);
 })();
 
 /* ===================== Servidores WMS personalizados (capas superpuestas) ===================== */
